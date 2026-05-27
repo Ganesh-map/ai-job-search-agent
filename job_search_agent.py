@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from google.oauth2.credentials import Credentials as UserCredentials
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -106,7 +107,7 @@ HYBRID_RE = re.compile(r"\b(hybrid)\b", re.IGNORECASE)
 ONSITE_RE = re.compile(r"\b(on[-\s]?site|office|in office)\b", re.IGNORECASE)
 
 ROLE_GROUP_SIZE = int(os.getenv("ROLE_GROUP_SIZE", "5"))
-MAX_SEARCH_QUERIES = int(os.getenv("MAX_SEARCH_QUERIES", "80"))
+MAX_SEARCH_QUERIES = int(os.getenv("MAX_SEARCH_QUERIES", "45"))
 SEARCH_RESULTS_PER_QUERY = min(int(os.getenv("SEARCH_RESULTS_PER_QUERY", "10")), 10)
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "30"))
 MIN_RELEVANT_JOBS = int(os.getenv("MIN_RELEVANT_JOBS", "10"))
@@ -162,6 +163,10 @@ class AgentConfigError(RuntimeError):
     """Raised when required cloud configuration is missing."""
 
 
+class SearchConfigurationError(RuntimeError):
+    """Raised when Google Custom Search credentials or quota are invalid."""
+
+
 def make_logger() -> tuple[logging.Logger, io.StringIO]:
     log_stream = io.StringIO()
     logger = logging.getLogger("job_search_agent")
@@ -189,14 +194,29 @@ def get_required_env(name: str) -> str:
     return value
 
 
-def load_service_account_credentials() -> Credentials:
+def load_google_credentials() -> Credentials | UserCredentials:
+    oauth_refresh_token = os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN")
+    oauth_client_id = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+    oauth_client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+    if oauth_refresh_token and oauth_client_id and oauth_client_secret:
+        return UserCredentials(
+            token=None,
+            refresh_token=oauth_refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=oauth_client_id,
+            client_secret=oauth_client_secret,
+            scopes=SCOPES,
+        )
+
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     raw_b64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_B64")
     if raw_b64:
         raw_json = base64.b64decode(raw_b64).decode("utf-8")
     if not raw_json:
         raise AgentConfigError(
-            "Set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_B64."
+            "Set GOOGLE_OAUTH_CLIENT_ID/GOOGLE_OAUTH_CLIENT_SECRET/"
+            "GOOGLE_OAUTH_REFRESH_TOKEN, or GOOGLE_SERVICE_ACCOUNT_JSON/"
+            "GOOGLE_SERVICE_ACCOUNT_B64."
         )
     info = json.loads(raw_json)
     return Credentials.from_service_account_info(info, scopes=SCOPES)
@@ -282,6 +302,13 @@ def google_search(
         params=params,
         timeout=HTTP_TIMEOUT_SECONDS,
     )
+    if response.status_code == 403:
+        raise SearchConfigurationError(
+            "Google Custom Search returned 403 Forbidden. Check that "
+            "GOOGLE_SEARCH_API_KEY is valid, unrestricted by application, "
+            "restricted to Custom Search API only, and that Custom Search API "
+            f"is enabled/quota is available. Response: {response.text[:500]}"
+        )
     response.raise_for_status()
     return response.json().get("items", [])
 
@@ -753,6 +780,8 @@ def collect_jobs(lookback_days: int, now: datetime) -> list[Job]:
     for index, (source, query) in enumerate(queries, start=1):
         try:
             items = google_search(session, api_key, cse_id, query, lookback_days)
+        except SearchConfigurationError:
+            raise
         except requests.RequestException as exc:
             LOGGER.warning("Search query failed for %s (%s/%s): %s", source, index, len(queries), exc)
             continue
@@ -816,27 +845,23 @@ def create_spreadsheet(
     now: datetime,
 ) -> str:
     title = f"JobSearch_{now.strftime('%Y-%m-%d')}"
-    spreadsheet = (
-        sheets_service.spreadsheets()
-        .create(body={"properties": {"title": title}}, fields="spreadsheetId,spreadsheetUrl")
-        .execute()
-    )
-    spreadsheet_id = spreadsheet["spreadsheetId"]
-    spreadsheet_url = spreadsheet["spreadsheetUrl"]
-
-    file_metadata = (
+    created_file = (
         drive_service.files()
-        .get(fileId=spreadsheet_id, fields="parents", supportsAllDrives=True)
+        .create(
+            body={
+                "name": title,
+                "mimeType": "application/vnd.google-apps.spreadsheet",
+                "parents": [folder_id],
+            },
+            fields="id, webViewLink",
+            supportsAllDrives=True,
+        )
         .execute()
     )
-    previous_parents = ",".join(file_metadata.get("parents", []))
-    drive_service.files().update(
-        fileId=spreadsheet_id,
-        addParents=folder_id,
-        removeParents=previous_parents,
-        fields="id, parents",
-        supportsAllDrives=True,
-    ).execute()
+    spreadsheet_id = created_file["id"]
+    spreadsheet_url = created_file.get(
+        "webViewLink", f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+    )
 
     rows = spreadsheet_rows(jobs)
     sheets_service.spreadsheets().values().update(
@@ -938,7 +963,7 @@ def upload_cloud_log(drive_service: Any, folder_id: str, now: datetime) -> None:
 def run() -> str:
     started = time.monotonic()
     now = datetime.now(IST)
-    credentials = load_service_account_credentials()
+    credentials = load_google_credentials()
     sheets_service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
     drive_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
     folder_id = get_required_env("GOOGLE_DRIVE_FOLDER_ID")
@@ -966,10 +991,10 @@ def main() -> int:
         spreadsheet_url = run()
         print(f"Spreadsheet created: {spreadsheet_url}")
         return 0
-    except (AgentConfigError, HttpError, requests.RequestException, Exception) as exc:
+    except (AgentConfigError, SearchConfigurationError, HttpError, requests.RequestException, Exception) as exc:
         LOGGER.exception("Job search agent failed: %s", exc)
         try:
-            credentials = load_service_account_credentials()
+            credentials = load_google_credentials()
             drive_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
             upload_cloud_log(drive_service, get_required_env("GOOGLE_DRIVE_FOLDER_ID"), datetime.now(IST))
         except Exception as log_exc:

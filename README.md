@@ -24,20 +24,60 @@ created directly in Google Drive.
    - Google Sheets API
    - Google Drive API
    - Custom Search API
-3. Create a Google service account and download its JSON key.
-4. Create or choose a Google Drive folder for the reports.
-5. Share that Drive folder with the service account email as Editor.
-6. Create a Programmable Search Engine at <https://programmablesearchengine.google.com/>.
-   Configure it to search the entire web, then copy its Search engine ID.
-7. Add these GitHub repository secrets:
-   - `GOOGLE_SERVICE_ACCOUNT_JSON`: the full service account JSON
+3. Create or choose a Google Drive folder for the reports.
+4. Create a Programmable Search Engine at <https://programmablesearchengine.google.com/>.
+   If full-web search is unavailable, configure `Sites to search` with:
+   - `linkedin.com/jobs/*`
+   - `in.indeed.com/*`
+   - `glassdoor.co.in/*`
+   - `naukri.com/*`
+   - `internshala.com/*`
+   - `wellfound.com/*`
+   - `cutshort.io/*`
+   - `instahyre.com/*`
+   - `ycombinator.com/jobs/*`
+   - `jobs.lever.co/*`
+   - `boards.greenhouse.io/*`
+   - `jobs.ashbyhq.com/*`
+   - `apply.workable.com/*`
+5. Copy the Programmable Search Engine ID.
+6. Add these GitHub repository secrets:
    - `GOOGLE_SEARCH_API_KEY`: Google API key with Custom Search API access
    - `GOOGLE_CSE_ID`: Programmable Search Engine ID
    - `GOOGLE_DRIVE_FOLDER_ID`: target Drive folder ID
 
-If your secret store has trouble with multi-line JSON, use base64 instead:
-set `GOOGLE_SERVICE_ACCOUNT_B64` in the workflow and remove
-`GOOGLE_SERVICE_ACCOUNT_JSON`.
+### Recommended Drive Auth: Personal Google Drive
+
+For a normal personal Google Drive folder, use OAuth user credentials. Service
+accounts often fail with `Service Accounts do not have storage quota` when they
+try to create files in My Drive.
+
+Create an OAuth client in Google Cloud:
+
+1. Go to `APIs & Services -> Credentials`.
+2. Click `Create credentials -> OAuth client ID`.
+3. Choose `Desktop app`.
+4. Copy the client ID and client secret.
+5. Generate a refresh token for the same Google account that owns the Drive
+   folder, with these scopes:
+   - `https://www.googleapis.com/auth/drive`
+   - `https://www.googleapis.com/auth/spreadsheets`
+6. Add these GitHub repository secrets:
+   - `GOOGLE_OAUTH_CLIENT_ID`
+   - `GOOGLE_OAUTH_CLIENT_SECRET`
+   - `GOOGLE_OAUTH_REFRESH_TOKEN`
+
+### Alternative Drive Auth: Service Account
+
+Use this only when writing to a Google Workspace Shared Drive or another setup
+where the service account is allowed to create Drive files.
+
+1. Create a Google service account and download its JSON key.
+2. Share the target Drive folder with the service account email as Editor.
+3. Add `GOOGLE_SERVICE_ACCOUNT_JSON` as a GitHub repository secret.
+
+If your secret store has trouble with multi-line JSON, use base64 instead and
+set `GOOGLE_SERVICE_ACCOUNT_B64`.
 
 ## Schedule
 
@@ -115,8 +155,10 @@ python job_search_agent.py
 
 ## Runtime Limits
 
-The GitHub Actions job has a 15-minute timeout. To keep the run bounded, the
-agent caps Google search calls with `MAX_SEARCH_QUERIES`, which defaults to 80.
+The GitHub Actions job has a 15-minute timeout. To keep the run bounded and
+stay below the common free Custom Search daily quota when fallback search runs,
+the agent caps Google search calls with `MAX_SEARCH_QUERIES`, which defaults to
+45.
 You can tune the following environment variables in the workflow:
 
 - `MAX_SEARCH_QUERIES`

@@ -12,6 +12,9 @@ jobs:
     timeout-minutes: 15
     env:
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+      GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
       GOOGLE_SEARCH_API_KEY: ${{ secrets.GOOGLE_SEARCH_API_KEY }}
       GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
       GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
@@ -19,7 +22,7 @@ jobs:
       MIN_RELEVANT_JOBS: "10"
       PRIMARY_LOOKBACK_DAYS: "6"
       FALLBACK_LOOKBACK_DAYS: "8"
-      MAX_SEARCH_QUERIES: "80"
+      MAX_SEARCH_QUERIES: "45"
 
     steps:
       - name: Check out repository
