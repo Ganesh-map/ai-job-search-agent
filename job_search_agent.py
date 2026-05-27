@@ -114,6 +114,7 @@ MIN_RELEVANT_JOBS = int(os.getenv("MIN_RELEVANT_JOBS", "10"))
 PRIMARY_LOOKBACK_DAYS = int(os.getenv("PRIMARY_LOOKBACK_DAYS", "6"))
 FALLBACK_LOOKBACK_DAYS = int(os.getenv("FALLBACK_LOOKBACK_DAYS", "8"))
 HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "12"))
+SEARCH_THROTTLE_SECONDS = float(os.getenv("SEARCH_THROTTLE_SECONDS", "1.0"))
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,42 @@ class SearchConfigurationError(RuntimeError):
     """Raised when Google Custom Search credentials or quota are invalid."""
 
 
+class NoRelevantJobsError(RuntimeError):
+    """Raised when a run cannot produce a useful spreadsheet."""
+
+
+class SecretRedactionFilter(logging.Filter):
+    """Remove configured secrets from logs before they are persisted."""
+
+    SECRET_QUERY_RE = re.compile(r"([?&](?:key|access_token|refresh_token)=)[^&\s]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        secret_names = (
+            "GOOGLE_SEARCH_API_KEY",
+            "GOOGLE_CSE_ID",
+            "GOOGLE_OAUTH_CLIENT_ID",
+            "GOOGLE_OAUTH_CLIENT_SECRET",
+            "GOOGLE_OAUTH_REFRESH_TOKEN",
+            "GOOGLE_SERVICE_ACCOUNT_JSON",
+            "GOOGLE_SERVICE_ACCOUNT_B64",
+        )
+        values = [os.getenv(name) for name in secret_names if os.getenv(name)]
+
+        def redact(value: Any) -> Any:
+            text = str(value)
+            for secret in values:
+                text = text.replace(secret, "[REDACTED]")
+            return self.SECRET_QUERY_RE.sub(r"\1[REDACTED]", text)
+
+        record.msg = redact(record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {key: redact(value) for key, value in record.args.items()}
+            else:
+                record.args = tuple(redact(arg) for arg in record.args)
+        return True
+
+
 def make_logger() -> tuple[logging.Logger, io.StringIO]:
     log_stream = io.StringIO()
     logger = logging.getLogger("job_search_agent")
@@ -176,10 +213,12 @@ def make_logger() -> tuple[logging.Logger, io.StringIO]:
 
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setFormatter(formatter)
+    stream_handler.addFilter(SecretRedactionFilter())
     logger.addHandler(stream_handler)
 
     memory_handler = logging.StreamHandler(log_stream)
     memory_handler.setFormatter(formatter)
+    memory_handler.addFilter(SecretRedactionFilter())
     logger.addHandler(memory_handler)
     return logger, log_stream
 
@@ -229,7 +268,7 @@ def build_http_session() -> requests.Session:
         read=3,
         status=3,
         backoff_factor=1.0,
-        status_forcelist=(429, 500, 502, 503, 504),
+        status_forcelist=(500, 502, 503, 504),
         allowed_methods=frozenset(["GET", "HEAD"]),
         respect_retry_after_header=True,
     )
@@ -256,9 +295,9 @@ def chunks(values: list[str], size: int) -> Iterable[list[str]]:
 def build_queries(lookback_days: int) -> list[tuple[str, str]]:
     role_groups = list(chunks(TARGET_ROLES, ROLE_GROUP_SIZE))
     queries: list[tuple[str, str]] = []
-    for source in SEARCH_SOURCES:
-        for prefix in source.query_prefixes:
-            for group in role_groups:
+    for group in role_groups:
+        for source in SEARCH_SOURCES:
+            for prefix in source.query_prefixes:
                 role_clause = " OR ".join(f'"{role}"' for role in group)
                 query = (
                     f"{prefix} ({role_clause}) "
@@ -308,6 +347,12 @@ def google_search(
             "GOOGLE_SEARCH_API_KEY is valid, unrestricted by application, "
             "restricted to Custom Search API only, and that Custom Search API "
             f"is enabled/quota is available. Response: {response.text[:500]}"
+        )
+    if response.status_code == 429:
+        raise SearchConfigurationError(
+            "Google Custom Search returned 429 Too Many Requests. The daily "
+            "quota or per-minute rate limit is exhausted; stopping this run "
+            f"to avoid creating an empty spreadsheet. Response: {response.text[:500]}"
         )
     response.raise_for_status()
     return response.json().get("items", [])
@@ -774,12 +819,14 @@ def collect_jobs(lookback_days: int, now: datetime) -> list[Job]:
     session = build_http_session()
     jobs: list[Job] = []
     seen_urls: set[str] = set()
+    successful_queries = 0
 
     queries = build_queries(lookback_days)
     LOGGER.info("Running %s search queries with d%s recency.", len(queries), lookback_days)
     for index, (source, query) in enumerate(queries, start=1):
         try:
             items = google_search(session, api_key, cse_id, query, lookback_days)
+            successful_queries += 1
         except SearchConfigurationError:
             raise
         except requests.RequestException as exc:
@@ -795,6 +842,14 @@ def collect_jobs(lookback_days: int, now: datetime) -> list[Job]:
             job = extract_job_from_result(session, item, source, lookback_days, now)
             if job:
                 jobs.append(job)
+        if SEARCH_THROTTLE_SECONDS > 0:
+            time.sleep(SEARCH_THROTTLE_SECONDS)
+
+    if successful_queries == 0:
+        raise SearchConfigurationError(
+            "No Google Custom Search queries succeeded. Check quota, API key "
+            "restrictions, Custom Search API enablement, and CSE configuration."
+        )
 
     return dedupe_jobs(jobs)
 
@@ -980,6 +1035,11 @@ def run() -> str:
         LOGGER.info("Found %s relevant jobs in fallback window.", len(jobs))
 
     jobs = jobs[:MAX_RESULTS]
+    if not jobs:
+        raise NoRelevantJobsError(
+            "No relevant jobs were found after the primary and fallback search windows; "
+            "not creating an empty spreadsheet."
+        )
     spreadsheet_url = create_spreadsheet(sheets_service, drive_service, folder_id, jobs, now)
     LOGGER.info("Execution completed in %.1f seconds.", time.monotonic() - started)
     upload_cloud_log(drive_service, folder_id, now)
@@ -991,7 +1051,14 @@ def main() -> int:
         spreadsheet_url = run()
         print(f"Spreadsheet created: {spreadsheet_url}")
         return 0
-    except (AgentConfigError, SearchConfigurationError, HttpError, requests.RequestException, Exception) as exc:
+    except (
+        AgentConfigError,
+        SearchConfigurationError,
+        NoRelevantJobsError,
+        HttpError,
+        requests.RequestException,
+        Exception,
+    ) as exc:
         LOGGER.exception("Job search agent failed: %s", exc)
         try:
             credentials = load_google_credentials()

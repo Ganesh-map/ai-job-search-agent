@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime, timedelta
+from unittest.mock import Mock
 
 import job_search_agent as agent
 
@@ -91,6 +92,29 @@ class JobSearchAgentTests(unittest.TestCase):
         deduped = agent.dedupe_jobs([low, high])
         self.assertEqual(len(deduped), 1)
         self.assertEqual(deduped[0].apply_link, "https://example.com/b")
+
+    def test_custom_search_429_stops_run(self):
+        response = Mock()
+        response.status_code = 429
+        response.text = "quota exceeded"
+        session = Mock()
+        session.get.return_value = response
+
+        with self.assertRaises(agent.SearchConfigurationError):
+            agent.google_search(session, "secret-key", "cse-id", "query", 6)
+
+    def test_redaction_filter_removes_query_key(self):
+        record = Mock()
+        record.msg = "failed https://example.com?key=abc123&cx=cse"
+        record.args = ()
+        agent.SecretRedactionFilter().filter(record)
+        self.assertIn("key=[REDACTED]", record.msg)
+        self.assertNotIn("abc123", record.msg)
+
+    def test_query_builder_balances_sources_under_cap(self):
+        queries = agent.build_queries(6)
+        first_sources = {source for source, _ in queries[:12]}
+        self.assertGreaterEqual(len(first_sources), 5)
 
 
 if __name__ == "__main__":
