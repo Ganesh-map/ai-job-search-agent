@@ -17,6 +17,8 @@ jobs:
       GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
       GOOGLE_SEARCH_API_KEY: ${{ secrets.GOOGLE_SEARCH_API_KEY }}
       GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
+      SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+      SEARCH_PROVIDER: ${{ vars.SEARCH_PROVIDER || 'serper' }}
       GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
       MAX_RESULTS: "30"
       MIN_RELEVANT_JOBS: "10"

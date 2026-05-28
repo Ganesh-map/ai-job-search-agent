@@ -115,6 +115,7 @@ PRIMARY_LOOKBACK_DAYS = int(os.getenv("PRIMARY_LOOKBACK_DAYS", "6"))
 FALLBACK_LOOKBACK_DAYS = int(os.getenv("FALLBACK_LOOKBACK_DAYS", "8"))
 HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "12"))
 SEARCH_THROTTLE_SECONDS = float(os.getenv("SEARCH_THROTTLE_SECONDS", "1.0"))
+SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "").strip().lower()
 
 
 @dataclass(frozen=True)
@@ -181,6 +182,7 @@ class SecretRedactionFilter(logging.Filter):
         secret_names = (
             "GOOGLE_SEARCH_API_KEY",
             "GOOGLE_CSE_ID",
+            "SERPER_API_KEY",
             "GOOGLE_OAUTH_CLIENT_ID",
             "GOOGLE_OAUTH_CLIENT_SECRET",
             "GOOGLE_OAUTH_REFRESH_TOKEN",
@@ -269,7 +271,7 @@ def build_http_session() -> requests.Session:
         status=3,
         backoff_factor=1.0,
         status_forcelist=(500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "HEAD"]),
+        allowed_methods=frozenset(["GET", "HEAD", "POST"]),
         respect_retry_after_header=True,
     )
     adapter = HTTPAdapter(max_retries=retry)
@@ -356,6 +358,74 @@ def google_search(
         )
     response.raise_for_status()
     return response.json().get("items", [])
+
+
+def serper_search(
+    session: requests.Session,
+    api_key: str,
+    query: str,
+    lookback_days: int,
+) -> list[dict[str, Any]]:
+    response = session.post(
+        "https://google.serper.dev/search",
+        headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+        json={
+            "q": query,
+            "gl": "in",
+            "hl": "en",
+            "num": SEARCH_RESULTS_PER_QUERY,
+            "tbs": f"qdr:d{lookback_days}",
+        },
+        timeout=HTTP_TIMEOUT_SECONDS,
+    )
+    if response.status_code in (401, 403):
+        raise SearchConfigurationError(
+            "Serper returned an authentication/permission error. Check that "
+            "SERPER_API_KEY is valid. Response: "
+            f"{response.text[:500]}"
+        )
+    if response.status_code == 429:
+        raise SearchConfigurationError(
+            "Serper returned 429 Too Many Requests. The quota or rate limit is "
+            f"exhausted. Response: {response.text[:500]}"
+        )
+    response.raise_for_status()
+    organic = response.json().get("organic", [])
+    return [
+        {
+            "title": item.get("title", ""),
+            "link": item.get("link", ""),
+            "snippet": item.get("snippet", ""),
+        }
+        for item in organic
+    ]
+
+
+def configured_search_provider() -> str:
+    if SEARCH_PROVIDER:
+        return SEARCH_PROVIDER
+    if os.getenv("SERPER_API_KEY"):
+        return "serper"
+    return "google"
+
+
+def run_search(
+    session: requests.Session,
+    provider: str,
+    query: str,
+    lookback_days: int,
+) -> list[dict[str, Any]]:
+    if provider == "serper":
+        return serper_search(session, get_required_env("SERPER_API_KEY"), query, lookback_days)
+    if provider == "google":
+        return google_search(
+            session,
+            get_required_env("GOOGLE_SEARCH_API_KEY"),
+            get_required_env("GOOGLE_CSE_ID"),
+            query,
+            lookback_days,
+        )
+    raise AgentConfigError(f"Unsupported SEARCH_PROVIDER: {provider}")
 
 
 def clean_text(value: Any) -> str:
@@ -814,18 +884,22 @@ def dedupe_jobs(jobs: list[Job]) -> list[Job]:
 
 
 def collect_jobs(lookback_days: int, now: datetime) -> list[Job]:
-    api_key = get_required_env("GOOGLE_SEARCH_API_KEY")
-    cse_id = get_required_env("GOOGLE_CSE_ID")
     session = build_http_session()
     jobs: list[Job] = []
     seen_urls: set[str] = set()
     successful_queries = 0
+    provider = configured_search_provider()
 
     queries = build_queries(lookback_days)
-    LOGGER.info("Running %s search queries with d%s recency.", len(queries), lookback_days)
+    LOGGER.info(
+        "Running %s %s search queries with d%s recency.",
+        len(queries),
+        provider,
+        lookback_days,
+    )
     for index, (source, query) in enumerate(queries, start=1):
         try:
-            items = google_search(session, api_key, cse_id, query, lookback_days)
+            items = run_search(session, provider, query, lookback_days)
             successful_queries += 1
         except SearchConfigurationError:
             raise

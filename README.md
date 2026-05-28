@@ -9,7 +9,7 @@ and uploads an execution log to Google Drive.
 ## What It Uses
 
 - Python 3.10+
-- Google Programmable Search API for public Google-indexed results
+- Serper.dev for Google-indexed public search results
 - Google Sheets API and Drive API
 - GitHub Actions cron scheduler
 - Environment variables and GitHub Secrets only
@@ -23,28 +23,16 @@ created directly in Google Drive.
 2. Enable these APIs:
    - Google Sheets API
    - Google Drive API
-   - Custom Search API
 3. Create or choose a Google Drive folder for the reports.
-4. Create a Programmable Search Engine at <https://programmablesearchengine.google.com/>.
-   If full-web search is unavailable, configure `Sites to search` with:
-   - `linkedin.com/jobs/*`
-   - `in.indeed.com/*`
-   - `glassdoor.co.in/*`
-   - `naukri.com/*`
-   - `internshala.com/*`
-   - `wellfound.com/*`
-   - `cutshort.io/*`
-   - `instahyre.com/*`
-   - `ycombinator.com/jobs/*`
-   - `jobs.lever.co/*`
-   - `boards.greenhouse.io/*`
-   - `jobs.ashbyhq.com/*`
-   - `apply.workable.com/*`
-5. Copy the Programmable Search Engine ID.
-6. Add these GitHub repository secrets:
-   - `GOOGLE_SEARCH_API_KEY`: Google API key with Custom Search API access
-   - `GOOGLE_CSE_ID`: Programmable Search Engine ID
+4. Create a Serper API key at <https://serper.dev/>.
+5. Add these GitHub repository secrets:
+   - `SERPER_API_KEY`: Serper API key for Google-style search results
    - `GOOGLE_DRIVE_FOLDER_ID`: target Drive folder ID
+
+Google Custom Search is still supported as an optional fallback with
+`SEARCH_PROVIDER=google`, `GOOGLE_SEARCH_API_KEY`, and `GOOGLE_CSE_ID`, but new
+Google projects may receive `This project does not have the access to Custom
+Search JSON API` even when the API appears enabled.
 
 ### Recommended Drive Auth: Personal Google Drive
 
@@ -155,15 +143,14 @@ python job_search_agent.py
 
 ## Runtime Limits
 
-The GitHub Actions job has a 15-minute timeout. To keep the run bounded and
-stay below the common free Custom Search daily quota when fallback search runs,
-the agent caps Google search calls with `MAX_SEARCH_QUERIES`, which defaults to
-45.
-The agent stops immediately on Custom Search `429 Too Many Requests` instead of
-creating an empty spreadsheet. If you manually rerun the workflow several times
-in one day, wait for the quota to reset or lower `MAX_SEARCH_QUERIES`.
+The GitHub Actions job has a 15-minute timeout. To keep the run bounded, the
+agent caps search calls with `MAX_SEARCH_QUERIES`, which defaults to 45.
+The agent stops immediately on provider quota errors instead of creating an
+empty spreadsheet. If you manually rerun the workflow several times in one day,
+wait for quota to reset or lower `MAX_SEARCH_QUERIES`.
 You can tune the following environment variables in the workflow:
 
+- `SEARCH_PROVIDER` (`serper` by default, or `google`)
 - `MAX_SEARCH_QUERIES`
 - `SEARCH_RESULTS_PER_QUERY`
 - `SEARCH_THROTTLE_SECONDS`

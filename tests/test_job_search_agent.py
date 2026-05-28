@@ -103,6 +103,34 @@ class JobSearchAgentTests(unittest.TestCase):
         with self.assertRaises(agent.SearchConfigurationError):
             agent.google_search(session, "secret-key", "cse-id", "query", 6)
 
+    def test_serper_search_normalizes_organic_results(self):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "organic": [
+                {
+                    "title": "Business Analyst Intern",
+                    "link": "https://example.com/job",
+                    "snippet": "India fresher role",
+                }
+            ]
+        }
+        response.raise_for_status = Mock()
+        session = Mock()
+        session.post.return_value = response
+
+        results = agent.serper_search(session, "secret-key", "query", 6)
+        self.assertEqual(
+            results,
+            [
+                {
+                    "title": "Business Analyst Intern",
+                    "link": "https://example.com/job",
+                    "snippet": "India fresher role",
+                }
+            ],
+        )
+
     def test_redaction_filter_removes_query_key(self):
         record = Mock()
         record.msg = "failed https://example.com?key=abc123&cx=cse"
