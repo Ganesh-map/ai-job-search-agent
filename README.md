@@ -144,7 +144,7 @@ python job_search_agent.py
 ## Runtime Limits
 
 The GitHub Actions job has a 15-minute timeout. To keep the run bounded, the
-agent caps search calls with `MAX_SEARCH_QUERIES`, which defaults to 45.
+workflow caps search calls with `MAX_SEARCH_QUERIES`, currently set to 24.
 The agent stops immediately on provider quota errors instead of creating an
 empty spreadsheet. If you manually rerun the workflow several times in one day,
 wait for quota to reset or lower `MAX_SEARCH_QUERIES`.
@@ -154,6 +154,10 @@ You can tune the following environment variables in the workflow:
 - `MAX_SEARCH_QUERIES`
 - `SEARCH_RESULTS_PER_QUERY`
 - `SEARCH_THROTTLE_SECONDS`
+- `PAGE_TIMEOUT_SECONDS`
+- `MAX_CANDIDATES_PER_QUERY`
+- `MAX_PAGE_FETCHES`
+- `MAX_RUNTIME_SECONDS`
 - `MAX_RESULTS`
 - `MIN_RELEVANT_JOBS`
 - `PRIMARY_LOOKBACK_DAYS`

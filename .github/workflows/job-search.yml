@@ -24,7 +24,12 @@ jobs:
       MIN_RELEVANT_JOBS: "10"
       PRIMARY_LOOKBACK_DAYS: "6"
       FALLBACK_LOOKBACK_DAYS: "8"
-      MAX_SEARCH_QUERIES: "45"
+      MAX_SEARCH_QUERIES: "24"
+      MAX_CANDIDATES_PER_QUERY: "4"
+      MAX_PAGE_FETCHES: "80"
+      PAGE_TIMEOUT_SECONDS: "5"
+      SEARCH_THROTTLE_SECONDS: "0.25"
+      MAX_RUNTIME_SECONDS: "780"
 
     steps:
       - name: Check out repository

@@ -114,8 +114,13 @@ MIN_RELEVANT_JOBS = int(os.getenv("MIN_RELEVANT_JOBS", "10"))
 PRIMARY_LOOKBACK_DAYS = int(os.getenv("PRIMARY_LOOKBACK_DAYS", "6"))
 FALLBACK_LOOKBACK_DAYS = int(os.getenv("FALLBACK_LOOKBACK_DAYS", "8"))
 HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "12"))
+PAGE_TIMEOUT_SECONDS = int(os.getenv("PAGE_TIMEOUT_SECONDS", "5"))
 SEARCH_THROTTLE_SECONDS = float(os.getenv("SEARCH_THROTTLE_SECONDS", "1.0"))
 SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "").strip().lower()
+MAX_PAGE_FETCHES = int(os.getenv("MAX_PAGE_FETCHES", "120"))
+MAX_CANDIDATES_PER_QUERY = int(os.getenv("MAX_CANDIDATES_PER_QUERY", "4"))
+MAX_RUNTIME_SECONDS = int(os.getenv("MAX_RUNTIME_SECONDS", "780"))
+MIN_SECONDS_FOR_OUTPUT = int(os.getenv("MIN_SECONDS_FOR_OUTPUT", "75"))
 
 
 @dataclass(frozen=True)
@@ -263,17 +268,20 @@ def load_google_credentials() -> Credentials | UserCredentials:
     return Credentials.from_service_account_info(info, scopes=SCOPES)
 
 
-def build_http_session() -> requests.Session:
-    retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        status=3,
-        backoff_factor=1.0,
-        status_forcelist=(500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "HEAD", "POST"]),
-        respect_retry_after_header=True,
-    )
+def build_http_session(enable_retries: bool = True) -> requests.Session:
+    if enable_retries:
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            status=3,
+            backoff_factor=1.0,
+            status_forcelist=(500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "HEAD", "POST"]),
+            respect_retry_after_header=True,
+        )
+    else:
+        retry = Retry(total=0, connect=0, read=0, status=0)
     adapter = HTTPAdapter(max_retries=retry)
     session = requests.Session()
     session.headers.update(
@@ -670,18 +678,18 @@ def summarize(text: str, max_chars: int = 360) -> str:
 
 
 def fetch_page(session: requests.Session, url: str) -> BeautifulSoup:
-    response = session.get(url, timeout=HTTP_TIMEOUT_SECONDS)
+    response = session.get(url, timeout=PAGE_TIMEOUT_SECONDS)
     response.raise_for_status()
     return BeautifulSoup(response.text, "html.parser")
 
 
 def is_apply_link_alive(session: requests.Session, url: str) -> bool:
     try:
-        response = session.head(url, allow_redirects=True, timeout=HTTP_TIMEOUT_SECONDS)
+        response = session.head(url, allow_redirects=True, timeout=PAGE_TIMEOUT_SECONDS)
         if 200 <= response.status_code < 400:
             return True
         if response.status_code in (403, 405):
-            response = session.get(url, allow_redirects=True, timeout=HTTP_TIMEOUT_SECONDS)
+            response = session.get(url, allow_redirects=True, timeout=PAGE_TIMEOUT_SECONDS)
             return 200 <= response.status_code < 400
         return False
     except requests.RequestException:
@@ -883,12 +891,19 @@ def dedupe_jobs(jobs: list[Job]) -> list[Job]:
     return sorted(deduped.values(), key=lambda item: item.match_score, reverse=True)
 
 
-def collect_jobs(lookback_days: int, now: datetime) -> list[Job]:
-    session = build_http_session()
+def collect_jobs(
+    lookback_days: int,
+    now: datetime,
+    deadline: float | None = None,
+) -> list[Job]:
+    search_session = build_http_session(enable_retries=True)
+    page_session = build_http_session(enable_retries=False)
     jobs: list[Job] = []
     seen_urls: set[str] = set()
     successful_queries = 0
+    page_fetches = 0
     provider = configured_search_provider()
+    deadline = deadline or time.monotonic() + MAX_RUNTIME_SECONDS - MIN_SECONDS_FOR_OUTPUT
 
     queries = build_queries(lookback_days)
     LOGGER.info(
@@ -898,8 +913,11 @@ def collect_jobs(lookback_days: int, now: datetime) -> list[Job]:
         lookback_days,
     )
     for index, (source, query) in enumerate(queries, start=1):
+        if time.monotonic() >= deadline:
+            LOGGER.warning("Stopping search early to preserve time for spreadsheet output.")
+            break
         try:
-            items = run_search(session, provider, query, lookback_days)
+            items = run_search(search_session, provider, query, lookback_days)
             successful_queries += 1
         except SearchConfigurationError:
             raise
@@ -908,14 +926,20 @@ def collect_jobs(lookback_days: int, now: datetime) -> list[Job]:
             continue
 
         LOGGER.info("Search %s/%s [%s] returned %s results.", index, len(queries), source, len(items))
-        for item in items:
+        for item in items[:MAX_CANDIDATES_PER_QUERY]:
+            if page_fetches >= MAX_PAGE_FETCHES or time.monotonic() >= deadline:
+                LOGGER.warning("Stopping page checks early to preserve time for spreadsheet output.")
+                break
             url = item.get("link", "")
             if not url or url in seen_urls:
                 continue
             seen_urls.add(url)
-            job = extract_job_from_result(session, item, source, lookback_days, now)
+            page_fetches += 1
+            job = extract_job_from_result(page_session, item, source, lookback_days, now)
             if job:
                 jobs.append(job)
+        if page_fetches >= MAX_PAGE_FETCHES or time.monotonic() >= deadline:
+            break
         if SEARCH_THROTTLE_SECONDS > 0:
             time.sleep(SEARCH_THROTTLE_SECONDS)
 
@@ -1091,13 +1115,14 @@ def upload_cloud_log(drive_service: Any, folder_id: str, now: datetime) -> None:
 
 def run() -> str:
     started = time.monotonic()
+    deadline = started + MAX_RUNTIME_SECONDS - MIN_SECONDS_FOR_OUTPUT
     now = datetime.now(IST)
     credentials = load_google_credentials()
     sheets_service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
     drive_service = build("drive", "v3", credentials=credentials, cache_discovery=False)
     folder_id = get_required_env("GOOGLE_DRIVE_FOLDER_ID")
 
-    jobs = collect_jobs(PRIMARY_LOOKBACK_DAYS, now)
+    jobs = collect_jobs(PRIMARY_LOOKBACK_DAYS, now, deadline)
     LOGGER.info("Found %s relevant jobs in primary window.", len(jobs))
     if len(jobs) < MIN_RELEVANT_JOBS and FALLBACK_LOOKBACK_DAYS > PRIMARY_LOOKBACK_DAYS:
         LOGGER.info(
@@ -1105,7 +1130,7 @@ def run() -> str:
             MIN_RELEVANT_JOBS,
             FALLBACK_LOOKBACK_DAYS,
         )
-        jobs = collect_jobs(FALLBACK_LOOKBACK_DAYS, now)
+        jobs = collect_jobs(FALLBACK_LOOKBACK_DAYS, now, deadline)
         LOGGER.info("Found %s relevant jobs in fallback window.", len(jobs))
 
     jobs = jobs[:MAX_RESULTS]
